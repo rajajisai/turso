@@ -6,7 +6,7 @@ use turso_sqlite3_parser::ast::{
 };
 
 use crate::error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY};
-use crate::schema::{self, Table};
+use crate::schema::{self, BTreeTable, Table};
 use crate::translate::emitter::{
     emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary, OperationMode,
 };
@@ -166,6 +166,16 @@ pub fn translate_insert(
         // TODO: upsert
         InsertBody::Select(select, _) => {
             // Simple Common case of INSERT INTO <table> VALUES (...)
+            if xfer_optimization(
+                schema,
+                btree_table.clone(),
+                &*select,
+                &mut program,
+                connection,
+            ) {
+                return Ok(program);
+            }
+
             if matches!(select.body.select.as_ref(),  OneSelect::Values(values) if values.len() <= 1)
             {
                 (
@@ -1024,4 +1034,164 @@ fn translate_virtual_table_insert(
     program.resolve_label(halt_label, program.offset());
 
     Ok(program)
+}
+
+fn xfer_optimization(
+    schema: &Schema,
+    dest_btree: Arc<BTreeTable>,
+    select: &ast::Select,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> bool {
+    // Early return for compound queries
+    if select.body.compounds.is_some() {
+        return false;
+    }
+
+    // Extract the inner select statement
+    let OneSelect::Select(select_inner) = select.body.select.as_ref() else {
+        return false;
+    };
+
+    // Check if it's a simple SELECT * (single column, star)
+    let columns = &select_inner.columns;
+    if columns.len() != 1 || !matches!(columns[0], ast::ResultColumn::Star) {
+        return false;
+    }
+
+    // Check for prohibited clauses
+    if select_inner.where_clause.is_some()
+        || select_inner.group_by.is_some()
+        || select_inner.distinctness.is_some()
+        || select_inner.window_clause.is_some()
+    {
+        return false;
+    }
+
+    // Extract and validate FROM clause
+    let Some(from) = &select_inner.from else {
+        return false;
+    };
+
+    // Check for joins or other operations
+    if from.joins.is_some() || from.op.is_some() {
+        return false;
+    }
+
+    // Extract table reference
+    let Some(select_table) = &from.select else {
+        return false;
+    };
+
+    // Validate it's a simple table reference
+    let ast::SelectTable::Table(qualified_name, _maybe_alias, _) = &**select_table else {
+        return false;
+    };
+
+    // Resolve database and table
+    let database_id = match connection.resolve_database_id(qualified_name) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+
+    //Get the table from the connection
+    let table_name = &qualified_name.name;
+    let table = connection.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
+
+    let Some(arc_table) = table else {
+        return false;
+    };
+
+    // Validate table compatibility
+    let Some(src_btree) = arc_table.btree() else {
+        return false;
+    };
+
+    // Check schema compatibility
+    if src_btree.has_rowid != dest_btree.has_rowid {
+        return false;
+    }
+    //Check if the number of columns are the same
+    if src_btree.columns.len() != dest_btree.columns.len() {
+        return false;
+    }
+
+    if src_btree.primary_key_columns.len() != dest_btree.primary_key_columns.len() {
+        return false;
+    }
+    //TODO: ADD MORE VALIDATIONS
+    for (src_col, dest_col) in src_btree.columns.iter().zip(dest_btree.columns.iter()) {
+        if src_col.notnull != dest_col.notnull {
+            return false;
+        }
+        if src_col.primary_key != dest_col.primary_key {
+            return false;
+        }
+        if src_col.unique != dest_col.unique {
+            return false;
+        }
+        if src_col.hidden != dest_col.hidden {
+            return false;
+        }
+    }
+
+    //If Validations pass, then we can use the xfer_optimization
+    tracing::debug!("Using xfer_optimizations");
+
+    let src_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(src_btree.clone()));
+    let dest_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(dest_btree.clone()));
+    let halt_label = program.allocate_label();
+
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: dest_cursor_id,
+        root_page: dest_btree.root_page.into(),
+        db: database_id,
+    });
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: src_cursor_id,
+        root_page: src_btree.root_page,
+        db: database_id,
+    });
+
+    let loop_start_label = program.allocate_label();
+    let end_loop_label = program.allocate_label();
+    let row_data_reg = program.alloc_register();
+    let rowid_reg = program.alloc_register();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: src_cursor_id,
+        pc_if_empty: end_loop_label,
+    });
+
+    program.resolve_label(loop_start_label, program.offset());
+
+    program.emit_insn(Insn::NewRowid {
+        cursor: dest_cursor_id,
+        rowid_reg: rowid_reg,
+        prev_largest_reg: 0,
+    });
+
+    program.emit_insn(Insn::RowData {
+        cursor_id: src_cursor_id,
+        dest: row_data_reg,
+    });
+
+    program.emit_insn(Insn::Insert {
+        cursor: dest_cursor_id,
+        key_reg: rowid_reg,
+        record_reg: row_data_reg,
+        flag: InsertFlags::new(),
+        table_name: dest_btree.name.clone(),
+    });
+
+    program.emit_insn(Insn::Next {
+        cursor_id: src_cursor_id,
+        pc_if_next: loop_start_label,
+    });
+
+    program.resolve_label(end_loop_label, program.offset());
+    program.resolve_label(halt_label, program.offset());
+
+    
+    true
 }
