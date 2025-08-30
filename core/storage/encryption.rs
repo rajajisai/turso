@@ -394,10 +394,10 @@ fn generate_secure_nonce() -> [u8; 32] {
 }
 
 #[cfg(test)]
-const DEFAULT_ENCRYPTED_PAGE_SIZE: usize = 4096;
-
 mod tests {
+    use super::*;
     use rand::Rng;
+    const DEFAULT_ENCRYPTED_PAGE_SIZE: usize = 4096;
 
     fn generate_random_hex_key() -> String {
         let mut rng = rand::thread_rng();
