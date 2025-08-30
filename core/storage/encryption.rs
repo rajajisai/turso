@@ -8,8 +8,6 @@ use aes_gcm::{
 };
 use std::ops::Deref;
 
-pub const DEFAULT_ENCRYPTED_PAGE_SIZE: usize = 4096;
-
 #[repr(transparent)]
 #[derive(Clone)]
 pub struct EncryptionKey([u8; 32]);
@@ -397,6 +395,8 @@ fn generate_secure_nonce() -> [u8; 32] {
 }
 
 #[cfg(test)]
+const DEFAULT_ENCRYPTED_PAGE_SIZE: usize = 4096;
+
 mod tests {
     use super::*;
     use rand::Rng;
